@@ -4,100 +4,94 @@ import pandas as pd
 import io
 import base64
 import re
+import pdf2image
+import pytesseract
+from PIL import Image
+import numpy as np
 
-def clean_text(text):
-    """Clean and standardize text from PDF"""
-    if text:
-        return ' '.join(text.split()).strip()
-    return ''
+def extract_text_from_image(image):
+    """Extract text from image using OCR"""
+    # Increase image resolution for better OCR
+    image = image.convert('L')  # Convert to grayscale
+    # Apply threshold to make text more clear
+    threshold = 200
+    image = image.point(lambda p: p > threshold and 255)
+    # Extract text using OCR
+    custom_config = r'--oem 3 --psm 6'
+    text = pytesseract.image_to_string(image, config=custom_config)
+    return text
 
-def extract_table_from_pdf(pdf_file):
-    """Extract tables from PDF with improved handling for ICICI format"""
+def parse_transaction_line(line):
+    """Parse a single line of transaction"""
+    # Match date pattern (DD/MM/YY or DD/MM/YYYY)
+    date_pattern = r'(\d{2}/\d{2}/(?:\d{2}|\d{4}))'
+    # Match amount pattern (numbers with optional decimals and commas)
+    amount_pattern = r'((?:Rs\.?|₹)?\s*[\d,]+\.?\d{0,2})'
+    
+    date_match = re.search(date_pattern, line)
+    amount_match = re.search(amount_pattern, line)
+    
+    if date_match and amount_match:
+        date = date_match.group(1)
+        amount = amount_match.group(1)
+        # Description is everything between date and amount
+        description = line[date_match.end():amount_match.start()].strip()
+        return [date, description, amount]
+    return None
+
+def extract_from_scanned_pdf(pdf_file):
+    """Extract data from scanned PDF using OCR"""
     all_data = []
     
-    with pdfplumber.open(pdf_file) as pdf:
-        for page in pdf.pages:
-            # First try to extract tables normally
-            tables = page.extract_tables()
-            
-            if not tables:
-                # If no tables found, try to extract text and parse it
-                text = page.extract_text()
-                lines = text.split('\n')
-                
-                # Process text line by line
-                for line in lines:
-                    # Clean the line
-                    line = clean_text(line)
-                    
-                    # Skip empty lines and headers
-                    if not line or 'Date' in line or 'Transaction Details' in line:
-                        continue
-                    
-                    # Try to match date patterns and transaction details
-                    date_match = re.search(r'\d{2}/\d{2}/\d{2,4}', line)
-                    if date_match:
-                        # Split the line into components
-                        parts = re.split(r'\s{2,}', line)
-                        if len(parts) >= 2:
-                            date = date_match.group(0)
-                            # Find amount (looking for numbers with decimal points)
-                            amount = re.search(r'[\d,]+\.\d{2}', line)
-                            amount = amount.group(0) if amount else ''
-                            # Everything else is the description
-                            description = ' '.join(parts[1:-1]) if len(parts) > 2 else parts[1]
-                            
-                            all_data.append([date, description, amount])
-            else:
-                # Process structured tables
-                for table in tables:
-                    for row in table:
-                        # Clean and filter row data
-                        cleaned_row = [clean_text(str(cell)) for cell in row if cell]
-                        if cleaned_row and any(cleaned_row):
-                            # Check if row contains date
-                            if any(re.search(r'\d{2}/\d{2}/\d{2,4}', cell) for cell in cleaned_row):
-                                all_data.append(cleaned_row)
-    
-    if not all_data:
-        return None
+    try:
+        # Convert PDF to images
+        images = pdf2image.convert_from_bytes(pdf_file.read())
         
-    # Create DataFrame with appropriate columns
-    columns = ['Date', 'Description', 'Amount']
-    df = pd.DataFrame(all_data)
-    
-    # Ensure we have the right number of columns
-    if len(df.columns) > len(columns):
-        # Combine extra columns into description
-        df = df.iloc[:, :len(columns)]
-    elif len(df.columns) < len(columns):
-        # Add missing columns
-        for i in range(len(df.columns), len(columns)):
-            df[i] = ''
+        for image in images:
+            # Extract text from image
+            text = extract_text_from_image(image)
+            lines = text.split('\n')
             
-    df.columns = columns
-    return df
+            for line in lines:
+                # Clean the line
+                line = ' '.join(line.split()).strip()
+                if line:
+                    # Try to parse transaction
+                    transaction = parse_transaction_line(line)
+                    if transaction:
+                        all_data.append(transaction)
+    
+        if not all_data:
+            return None
+            
+        # Create DataFrame
+        df = pd.DataFrame(all_data, columns=['Date', 'Description', 'Amount'])
+        return df
+    
+    except Exception as e:
+        st.error(f"Error in OCR processing: {str(e)}")
+        return None
 
 def process_credit_card_bill(df):
-    """Process the extracted data with improved handling"""
-    if df is None:
+    """Process the extracted data"""
+    if df is None or df.empty:
         return None
         
     # Remove any empty rows
     df = df.dropna(how='all')
     
-    # Remove any duplicate rows
-    df = df.drop_duplicates()
-    
     # Clean up date format
     try:
         df['Date'] = pd.to_datetime(df['Date'], format='%d/%m/%Y', errors='coerce')
+        # If above fails, try with 2-digit year
+        mask = df['Date'].isna()
+        df.loc[mask, 'Date'] = pd.to_datetime(df.loc[mask, 'Date'], format='%d/%m/%y', errors='coerce')
         df['Date'] = df['Date'].dt.strftime('%Y-%m-%d')
     except:
         pass
     
     # Clean up amount format
-    df['Amount'] = df['Amount'].replace('[\$,]', '', regex=True)
+    df['Amount'] = df['Amount'].replace(r'[^\d.-]', '', regex=True)
     df['Amount'] = pd.to_numeric(df['Amount'], errors='coerce')
     
     # Remove rows where date or amount is invalid
@@ -133,11 +127,11 @@ def main():
     
     if uploaded_file is not None:
         try:
-            with st.spinner('Processing PDF...'):
-                # Process the PDF
-                df = extract_table_from_pdf(uploaded_file)
+            with st.spinner('Processing PDF... This may take a minute for scanned documents...'):
+                # Try OCR extraction for scanned PDFs
+                df = extract_from_scanned_pdf(uploaded_file)
                 
-                if df is not None:
+                if df is not None and not df.empty:
                     df = process_credit_card_bill(df)
                     
                     if df is not None and not df.empty:
@@ -148,7 +142,7 @@ def main():
                         # Download button
                         st.markdown(get_download_link(df, format_type), unsafe_allow_html=True)
                         
-                        # Display some basic statistics
+                        # Display statistics
                         st.subheader("Summary Statistics:")
                         num_transactions = len(df)
                         st.write(f"Total number of transactions: {num_transactions}")
@@ -157,7 +151,7 @@ def main():
                             total_amount = df['Amount'].sum()
                             st.write(f"Total amount: ₹{total_amount:,.2f}")
                     else:
-                        st.error("Could not process the data after extraction. Please check if the PDF contains valid transaction data.")
+                        st.error("Could not process the extracted data. Please check if the PDF contains valid transaction data.")
                 else:
                     st.error("No transaction data found in the PDF. Please make sure you've uploaded a valid credit card statement.")
                     
