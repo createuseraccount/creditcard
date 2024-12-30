@@ -3,28 +3,83 @@ import pdfplumber
 import pandas as pd
 import io
 import base64
+import re
+
+def clean_text(text):
+    """Clean and standardize text from PDF"""
+    if text:
+        return ' '.join(text.split()).strip()
+    return ''
 
 def extract_table_from_pdf(pdf_file):
-    """Extract tables from PDF and convert to DataFrame"""
-    all_tables = []
+    """Extract tables from PDF with improved handling for ICICI format"""
+    all_data = []
     
     with pdfplumber.open(pdf_file) as pdf:
         for page in pdf.pages:
+            # First try to extract tables normally
             tables = page.extract_tables()
-            for table in tables:
-                # Clean up the table data
-                cleaned_table = [[cell.strip() if cell else '' for cell in row] for row in table]
-                all_tables.extend(cleaned_table)
+            
+            if not tables:
+                # If no tables found, try to extract text and parse it
+                text = page.extract_text()
+                lines = text.split('\n')
+                
+                # Process text line by line
+                for line in lines:
+                    # Clean the line
+                    line = clean_text(line)
+                    
+                    # Skip empty lines and headers
+                    if not line or 'Date' in line or 'Transaction Details' in line:
+                        continue
+                    
+                    # Try to match date patterns and transaction details
+                    date_match = re.search(r'\d{2}/\d{2}/\d{2,4}', line)
+                    if date_match:
+                        # Split the line into components
+                        parts = re.split(r'\s{2,}', line)
+                        if len(parts) >= 2:
+                            date = date_match.group(0)
+                            # Find amount (looking for numbers with decimal points)
+                            amount = re.search(r'[\d,]+\.\d{2}', line)
+                            amount = amount.group(0) if amount else ''
+                            # Everything else is the description
+                            description = ' '.join(parts[1:-1]) if len(parts) > 2 else parts[1]
+                            
+                            all_data.append([date, description, amount])
+            else:
+                # Process structured tables
+                for table in tables:
+                    for row in table:
+                        # Clean and filter row data
+                        cleaned_row = [clean_text(str(cell)) for cell in row if cell]
+                        if cleaned_row and any(cleaned_row):
+                            # Check if row contains date
+                            if any(re.search(r'\d{2}/\d{2}/\d{2,4}', cell) for cell in cleaned_row):
+                                all_data.append(cleaned_row)
     
-    if not all_tables:
+    if not all_data:
         return None
         
-    # Convert to DataFrame
-    df = pd.DataFrame(all_tables[1:], columns=all_tables[0])
+    # Create DataFrame with appropriate columns
+    columns = ['Date', 'Description', 'Amount']
+    df = pd.DataFrame(all_data)
+    
+    # Ensure we have the right number of columns
+    if len(df.columns) > len(columns):
+        # Combine extra columns into description
+        df = df.iloc[:, :len(columns)]
+    elif len(df.columns) < len(columns):
+        # Add missing columns
+        for i in range(len(df.columns), len(columns)):
+            df[i] = ''
+            
+    df.columns = columns
     return df
 
 def process_credit_card_bill(df):
-    """Process the extracted data specifically for credit card bills"""
+    """Process the extracted data with improved handling"""
     if df is None:
         return None
         
@@ -34,19 +89,19 @@ def process_credit_card_bill(df):
     # Remove any duplicate rows
     df = df.drop_duplicates()
     
-    # Try to convert date columns to datetime
-    date_columns = df.columns[df.columns.str.contains('date', case=False)]
-    for col in date_columns:
-        try:
-            df[col] = pd.to_datetime(df[col])
-        except:
-            pass
+    # Clean up date format
+    try:
+        df['Date'] = pd.to_datetime(df['Date'], format='%d/%m/%Y', errors='coerce')
+        df['Date'] = df['Date'].dt.strftime('%Y-%m-%d')
+    except:
+        pass
     
-    # Try to convert amount columns to numeric
-    amount_columns = df.columns[df.columns.str.contains('amount|price|cost', case=False)]
-    for col in amount_columns:
-        df[col] = df[col].replace('[\$,]', '', regex=True)
-        df[col] = pd.to_numeric(df[col], errors='ignore')
+    # Clean up amount format
+    df['Amount'] = df['Amount'].replace('[\$,]', '', regex=True)
+    df['Amount'] = pd.to_numeric(df['Amount'], errors='coerce')
+    
+    # Remove rows where date or amount is invalid
+    df = df.dropna(subset=['Date', 'Amount'])
     
     return df
 
@@ -85,29 +140,30 @@ def main():
                 if df is not None:
                     df = process_credit_card_bill(df)
                     
-                    # Show preview
-                    st.subheader("Preview of extracted data:")
-                    st.dataframe(df.head())
-                    
-                    # Download button
-                    st.markdown(get_download_link(df, format_type), unsafe_allow_html=True)
-                    
-                    # Display some basic statistics
-                    st.subheader("Summary Statistics:")
-                    num_transactions = len(df)
-                    st.write(f"Total number of transactions: {num_transactions}")
-                    
-                    # If there's an amount column, show total
-                    amount_cols = df.columns[df.columns.str.contains('amount|price|cost', case=False)]
-                    if not amount_cols.empty:
-                        total_amount = df[amount_cols[0]].sum()
-                        st.write(f"Total amount: ${total_amount:,.2f}")
+                    if df is not None and not df.empty:
+                        # Show preview
+                        st.subheader("Preview of extracted data:")
+                        st.dataframe(df.head())
+                        
+                        # Download button
+                        st.markdown(get_download_link(df, format_type), unsafe_allow_html=True)
+                        
+                        # Display some basic statistics
+                        st.subheader("Summary Statistics:")
+                        num_transactions = len(df)
+                        st.write(f"Total number of transactions: {num_transactions}")
+                        
+                        if 'Amount' in df.columns:
+                            total_amount = df['Amount'].sum()
+                            st.write(f"Total amount: ₹{total_amount:,.2f}")
+                    else:
+                        st.error("Could not process the data after extraction. Please check if the PDF contains valid transaction data.")
                 else:
-                    st.error("No tables found in the PDF. Please make sure the PDF contains tabular data.")
+                    st.error("No transaction data found in the PDF. Please make sure you've uploaded a valid credit card statement.")
                     
         except Exception as e:
             st.error(f"Error processing file: {str(e)}")
-            st.write("Please make sure you've uploaded a valid PDF file with tabular data.")
+            st.write("Please make sure you've uploaded a valid PDF file with transaction data.")
 
 if __name__ == '__main__':
     main()
